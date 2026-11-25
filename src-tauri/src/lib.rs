@@ -113,37 +113,10 @@ fn cmd_log_create_new(message: String) -> Result<(), String> {
     create_new_log(&message)
 }
 
-// // 共通の書き込み関数（ReactコマンドからもRust内部からも呼べる）
-// pub fn write_log(message: &str) -> Result<(), String> {
-//     let path = get_log_file_path("app.log")?;
-//     let mut file = OpenOptions::new()
-//         .write(true)
-//         .append(true)
-//         .create(true)
-//         .open(path)
-//         .map_err(|e| format!("ファイルオープン失敗: {}", e))?;
-
-//     let now = Local::now().format("%Y/%m/%d %H:%M:%S");
-//     writeln!(file, "{} {}", now, message)
-//         .map_err(|e| format!("書き込み失敗: {}", e))?;
-
-//     Ok(())
-// }
-
-// // Rust内で Go の log.Println 感覚で使えるマクロ
-// #[macro_export]
-// macro_rules! log_println {
-//     ($($arg:tt)*) => {{
-//         let msg = format!($($arg)*);
-//         let _ = $crate::write_log(&msg);
-//     }};
-// }
-
-// fn some_rust_function() {
-//     let user_id = 42;
-//     // Go の log.Println と同じ感覚で app.log に出力
-//     log_println!("Rust側で処理を実行しました: user_id={}", user_id);
-// }
+#[tauri::command]
+fn read_map_file(path: String) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|e| e.to_string())
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Point2D {
@@ -242,9 +215,6 @@ pub struct AffineParams {
 fn read_json_text(file_path: String) -> Result<String, String> {
     fs::read_to_string(&file_path).map_err(|e| format!("ファイル読込エラー: {}", e))
 }
-// async fn load_file_content(path: String) -> Result<String, String> {
-//     fs::read_to_string(&path).map_err(|e| e.to_string())
-// }
 
 /// 2. DXFテキストを変換し、変換後のDXFテキストを返す
 #[tauri::command]
@@ -306,101 +276,6 @@ fn save_dxf_text(file_path: String, content: String) -> Result<String, String> {
     fs::write(&file_path, content).map_err(|e| format!("ファイル保存エラー: {}", e))?;
     Ok("保存が完了しました".into())
 }
-// async fn save_file_content(path: String, content: String) -> Result<(), String> {
-//     fs::write(&path, content).map_err(|e| e.to_string())
-// }
-
-// #[tauri::command]
-// fn process_text(content: String) -> String {
-//     // ここにやりたい処理を書く（例：行数カウント＋大文字変換）
-//     let line_count = content.lines().count();
-//     let upper = content.to_uppercase();
-    
-//     format!("【処理完了：全 {} 行】\n\n{}", line_count, upper)
-// }
-
-// #[tauri::command]
-// fn process_dxf_affine(content: String, params: AffineParams) -> Result<String, String> {
-//     // 文字列からDXFを読み込む
-//     let mut cursor = Cursor::new(content.as_bytes());
-//     let drawing = Drawing::load(&mut cursor).map_err(|e| format!("DXFパースエラー: {}", e))?;
-
-//     let mut output_lines = Vec::new();
-//     output_lines.push("EntityType,Original_X,Original_Y,Transformed_X,Transformed_Y".to_string());
-
-//     // エンティティごとにXY座標を抽出して変換（例：Point と Line）
-//     for entity in drawing.entities() {
-//         match &entity.specific {
-//             EntityType::ModelPoint(pt) => {
-//                 let (nx, ny) = transform_xy(pt.location.x, pt.location.y, &params);
-//                 output_lines.push(format!(
-//                     "POINT,{:.4},{:.4},{:.4},{:.4}",
-//                     pt.location.x, pt.location.y, nx, ny
-//                 ));
-//             }
-//             EntityType::Line(line) => {
-//                 let (nx1, ny1) = transform_xy(line.p1.x, line.p1.y, &params);
-//                 let (nx2, ny2) = transform_xy(line.p2.x, line.p2.y, &params);
-//                 output_lines.push(format!(
-//                     "LINE_START,{:.4},{:.4},{:.4},{:.4}",
-//                     line.p1.x, line.p1.y, nx1, ny1
-//                 ));
-//                 output_lines.push(format!(
-//                     "LINE_END,{:.4},{:.4},{:.4},{:.4}",
-//                     line.p2.x, line.p2.y, nx2, ny2
-//                 ));
-//             }
-//             // 必要に応じて LwPolyline, Circle, Arc などを追加
-//             _ => {}
-//         }
-//     }
-//     Ok(output_lines.join("\n"))
-// }
-
-// アフィン変換の計算
-// fn transform_xy(x: f64, y: f64, p: &AffineParams) -> (f64, f64) {
-//     let rad = p.angle_deg.to_radians();
-//     let cos_a = rad.cos();
-//     let sin_a = rad.sin();
-//     // スケーリング -> 回転 -> 平行移動
-//     let sx = x * p.scale_x;
-//     let sy = y * p.scale_y;
-
-//     let nx = sx * cos_a - sy * sin_a + p.tx;
-//     let ny = sx * sin_a + sy * cos_a + p.ty;
-//     (nx, ny)
-// }
-
-// #[tauri::command]
-// fn transform_dxf_lines(content: String, params: AffineParams) -> Result<String, String> {
-//     // 1. 元のDXFを読み込む
-//     let mut cursor = Cursor::new(content.as_bytes());
-//     let mut drawing = Drawing::load(&mut cursor)
-//         .map_err(|e| format!("DXF読み込みエラー: {}", e))?;
-
-//     // 2. 線分（LINE）要素のみ座標を書き換える
-//     for entity in drawing.entities_mut() {
-//         if let EntityType::Line(ref mut line) = entity.specific {
-//             let (nx1, ny1) = transform_xy(line.p1.x, line.p1.y, &params);
-//             let (nx2, ny2) = transform_xy(line.p2.x, line.p2.y, &params);
-
-//             line.p1.x = nx1;
-//             line.p1.y = ny1;
-//             line.p2.x = nx2;
-//             line.p2.y = ny2;
-//         }
-//     }
-
-//     // 3. 変換後のDXFデータをメモリ上のバッファに書き出す
-//     let mut out_buffer = Vec::new();
-//     drawing
-//         .save(&mut out_buffer)
-//         .map_err(|e| format!("DXF生成エラー: {}", e))?;
-
-//     // 4. UTF-8文字列としてフロントエンドへ返す
-//     String::from_utf8(out_buffer)
-//         .map_err(|e| format!("文字列変換エラー: {}", e))
-// }
 
 // --- アプリケーションエントリーポイント ---
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -410,17 +285,15 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             read_json_text,
             transform_dxf_text,
             save_dxf_text,
             cmd_log_println,
-            cmd_log_create_new
+            cmd_log_create_new,
+            read_map_file
         ])
-        // .plugin(tauri_plugin_dialog::init())
-        // .plugin(tauri_plugin_fs::init())
-        // .invoke_handler(tauri::generate_handler![process_text, load_file_content, save_file_content, process_dxf_affine, transform_dxf_lines])
-        // .invoke_handler(tauri::generate_handler![read_json_text, save_dxf_text, transform_dxf_text])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
