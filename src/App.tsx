@@ -2,21 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { emit, listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { readTextFile } from "@tauri-apps/plugin-fs";
-import L from "leaflet";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { setWorkerUrl } from "maplibre-gl";
+import workerUrl from  "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
+import type { FillLayerSpecification, LineLayerSpecification } from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
+setWorkerUrl(workerUrl);
+import proj4 from "proj4";
+import type { FeatureCollection, Geometry, Position } from "geojson";
 import { logger } from "./utils/logger";
-
-// Viteビルド時のLeafletピン画像リンク切れ対策
-import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
-import markerIcon from "leaflet/dist/images/marker-icon.png";
-import markerShadow from "leaflet/dist/images/marker-shadow.png";
-
-delete (L.Icon.Default.prototype as any)._getIconUrl;
-L.Icon.Default.mergeOptions({
-  iconUrl: markerIcon,
-  iconRetinaUrl: markerIcon2x,
-  shadowUrl: markerShadow,
-})
+import { Layer } from "leaflet";
 
 // タブの種類を型定義
 type TabId = "building" | "rooftype" | "landuse" | "terrain";
@@ -33,41 +28,28 @@ const TABS: Tab[] = [
   { id: "terrain", label: "地形モデル" },
 ];
 
+// 1. 変換元（平面直角座標系）の定義をproj4に登録
+// 例: JGD2011 / 平面直角座標第9系 (EPSG:6677)
+proj4.defs([
+  ['EPSG:6675',
+  '+proj=tmerc +lat_0=36 +lon_0=137.1666666666667 +k=0.9999 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs'],
+  ['EPSG:6677',
+  '+proj=tmerc +lat_0=36 +lon_0=139.8333333333333 +k=0.9999 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs']
+]);
+
+const handleInit = async () => {
+  // ファイルを新規作成（既存リセット）して出力
+  await logger.createNew('[React] ログを初期化しました');
+};
+const handleAction = async () => {
+  // 追記出力（Go の log.Println と同じ感覚）
+  await logger.println('[React] ボタンクリック:', { user: 'taro', coount: 1 });
+};
+
 // extractFileNameでファイル名を取得する
 function extractFileName(filePath: string): string {
   return filePath.replace(/^.*[\\/]/, "");
 }
-
-// サンプル地図のデータ（GeoJSON形式：名古屋城周辺のピンとエリア）
-const SAMPLE_GEOJSON: GeoJSON.FeatureCollection = {
-  type: "FeatureCollection",
-  features: [
-    {
-      type: "Feature",
-      properties: {name: "名古屋城"},
-      geometry: {
-        type: "Point",
-        coordinates: [136.8997, 35.1856],
-      },
-    },
-    {
-      type: "Feature",
-      properties: { name: "名城公園エリア" },
-      geometry: {
-        type: "Polygon",
-        coordinates: [
-          [
-            [136.398, 35.188],
-            [136.903, 35.188],
-            [136.903, 35.192],
-            [136.898, 35.192],
-            [136.898, 35.188],
-          ],
-        ],
-      },
-    },
-  ],
-};
 
 // 1. メイン画面コンポーネント
 function MainScreen() {
@@ -75,22 +57,58 @@ function MainScreen() {
   const [resultText, setResultText] = useState<string>('');
   const [statusMessage, setStatusMessage] = useState<string>('');
   const [fileName, setFileName] = useState<string | null>(null); 
-  const [activeTab, setActiveTab] = useState<TabId>("building")
-
-  const handleInit = async () => {
-    // ファイルを新規作成（既存リセット）して出力
-    await logger.createNew('[React] ログを初期化しました');
-  };
-
-  const handleAction = async () => {
-    // 追記出力（Go の log.Println と同じ感覚）
-    await logger.println('[React] ボタンクリック:', { user: 'taro', coount: 1 });
-  };
-
+  const [activeTab, setActiveTab] = useState<TabId>("building");
+  const [convertedData, setConvertedData] = useState<FeatureCollection | null>(null);
   const [status, setStatus] = useState("待機中");
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
+  const [selectedEpsg, setSelectedEpsg] = useState<string>('EPSG:6675');
+  const [convertedGeoJson, setConvertedGeoJson] = useState<FeatureCollection | null>(null);
 
-  const handleSelectAndOpenMap = async () => {
+  // 座標配列を再帰的に変換するヘルパー関数
+  const transformCoordinates = (coords: any, sourceProj: string, targetProj: string): any => {
+    // [X, Y] または [X, Y, Z] の数値配列（末端の座標点）に到達した場合
+    if (typeof coords[0] === 'number' && typeof coords[1] === 'number') {
+      // 注意: 日本の測量座標系(Xが北、Yが東)とGIS(経度X、緯度Y)の軸順序に注意
+      // proj4は [Easting(東方向), Northing(北方向)] の順で入力を受け取ります
+      const [lon, lat] = proj4(sourceProj, targetProj, [coords[0], coords[1]]);
+      return coords.length > 2 ? [lon, lat, coords[2]] : [lon, lat];
+    }
+    // 配列がネストしている場合（LineString, Polygon, MultiPolygonなど）は再帰処理
+    return coords.map((coord: any) => transformCoordinates(coord, sourceProj, targetProj));
+  };
+
+  // GeoJSON全体のジオメトリを変換する関数
+  const convertGeoJsonToLatLon = (
+    geojson: FeatureCollection,
+    sourceEpsg: string
+  ): FeatureCollection => {
+    const targetEpsg = 'EPSG:4326'; // WGS84 (緯度経度)
+    const convertedFeatures = geojson.features.map((feature) => {
+      if (!feature.geometry) return feature;
+      const convertGeometry = (geometry: Geometry): Geometry => {
+        if (geometry.type === 'GeometryCollection') {
+          return {
+            ...geometry,
+            geometries: geometry.geometries.map(convertGeometry),
+          };
+        }
+        return {
+          ...geometry,
+          coordinates: transformCoordinates(geometry.coordinates, sourceEpsg, targetEpsg),
+        } as Geometry;
+      };
+      return {
+        ...feature,
+        geometry: convertGeometry(feature.geometry),
+      };
+    });
+    return {
+      ...geojson,
+      features: convertedFeatures,
+    };
+  };
+
+  const handleSelectMap = async () => {
     try {
       // 1. ファイル選択ダイアログを開く
       const selectedPath = await open({
@@ -110,18 +128,27 @@ function MainScreen() {
         return;
       }
 
+      if (typeof selectedPath === "string") {
+        setFileName(extractFileName(selectedPath));
+      };
+
       setSelectedFileName(selectedPath);
       setStatus("ファイル読み込み中...");
 
       // 2. 選択されたファイルのテキストを読み込み、JSONとしてパース
       const fileContent = await readTextFile(selectedPath);
+      setSourceText(fileContent);
+      setResultText('');
       const geoJsonData = JSON.parse(fileContent);
-
       // 簡易バリデーション
       if (!geoJsonData || typeof geoJsonData !== "object" || !geoJsonData.type) {
         throw new Error("有効なGeoJSONフォーマットではありません。");
       }
 
+      setStatus("座標を変換中...");
+      const result = convertGeoJsonToLatLon(geoJsonData, selectedEpsg);
+      setConvertedData(result);
+      
       // 3. すでに地図ウィンドウが開いていれば一旦閉じる
       const existingWin = await WebviewWindow.getByLabel("map-window");
       if (existingWin) {
@@ -141,7 +168,8 @@ function MainScreen() {
       webview.once("tauri://created", async () => {
         // 別画面側のマウント完了通知を待ってからデータを送信
         const unlisten = await listen("map-window-ready", async () => {
-          await emit("load-map-data", geoJsonData);
+          // await emit("load-map-data", geoJsonData);
+          await emit("load-map-data", result);
           setStatus("別画面に地図データを表示しました");
           unlisten();
         });
@@ -156,6 +184,31 @@ function MainScreen() {
       setStatus(`エラー: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
+
+  // function handleSelectAndConvert(event: MouseEvent<HTMLButtonElement, MouseEvent>): void {
+  //   event.preventDefault();
+
+  //   if (!sourceText.trim()) {
+  //     setStatus("先にGeoJSONファイルを開いてください");
+  //     return;
+  //   }
+
+  //   try {
+  //     setStatus("座標を変換中...");
+  //     const geoJsonData = JSON.parse(sourceText) as FeatureCollection;
+  //     if (geoJsonData.type !== "FeatureCollection" || !Array.isArray(geoJsonData.features)) {
+  //       throw new Error("有効なGeoJSON FeatureCollectionではありません。");
+  //     }
+
+  //     const result = convertGeoJsonToLatLon(geoJsonData, selectedEpsg);
+  //     setConvertedData(result);
+  //     setResultText(JSON.stringify(result, null, 2));
+  //     setStatus("座標変換が完了しました");
+  //   } catch (error) {
+  //     console.error(error);
+  //     setStatus(`変換エラー: ${error instanceof Error ? error.message : String(error)}`);
+  //   }
+  // }
 
   // 3. 変換後のファイルを保存する
   // const handleSaveDxf = async () => {
@@ -205,9 +258,8 @@ function MainScreen() {
   //   marginRight: '12px',
   // };
 
-
   return (
-    <div style={{ display: "fles", flexDirection: "column", height: "100vh" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
       <h2>3次元都市モデル制作ツール</h2>
       {/* タブバー上部エリア */}
       <div style={{ display: "flex", borderBottom: "1px solid #ccc", background: "#f5f5f5" }}>
@@ -216,7 +268,7 @@ function MainScreen() {
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
             style={{
-              padding: "8px, 16px",
+              padding: "8px 16px",
               border: "none",
               background: activeTab === tab.id ? "#fff" : "transparent",
               borderBottom: activeTab === tab.id ? "2px solid #007acc" : "none",
@@ -236,13 +288,13 @@ function MainScreen() {
           
           {/* 上部操作ボタン */}
           <div style={{ marginBottom: '16px', display: 'flex', gap: '12px', alignItems: 'center' }}>
-            <button onClick={handleSelectAndOpenMap} style={{ padding: '8px 16px', cursor: 'pointer' }}>
+            <button onClick={handleSelectMap} style={{ padding: '8px 16px', cursor: 'pointer' }}>
               GeoJSONファイルを開く
             </button>
-            <button onClick={handleSelectAndOpenMap} style={{ padding: '8px 16px', cursor: 'pointer', fontWeight: 'bold' }}>
+            <button onClick={handleSelectMap} style={{ padding: '8px 16px', cursor: 'pointer', fontWeight: 'bold' }}>
               変換を実行する
             </button>
-            <button onClick={handleSelectAndOpenMap} style={{ padding: '8px 16px', cursor: 'pointer' }}>
+            <button onClick={handleSelectMap} style={{ padding: '8px 16px', cursor: 'pointer' }}>
               変換後のファイルを保存する
             </button>
           </div>
@@ -254,7 +306,7 @@ function MainScreen() {
             </div>
           )}
 
-          <div>
+          <div style={{ fontSize: '14px' }}>
             <p> 開いているファイル： {fileName ?? "未選択"}</p>
           </div>
 
@@ -286,41 +338,27 @@ function MainScreen() {
               />
             </div>
           </div>
+
+          <div style={{ marginBottom: '1rem' }}>
+            <label>変換元の座標系: </label>
+            <select value={selectedEpsg} onChange={(e) => setSelectedEpsg(e.target.value)}>
+              <option value="EPSG:6675">第7系（愛知・岐阜・三重など）</option>
+              <option value="EPSG:6677">第9系（東京・福島など）</option>
+            </select>
+          </div>
+
+          {/* <button onClick={handleConvert} style={{ padding: '0.5rem 1rem', cursor: 'pointer' }}>
+            GeoJSONファイルを地図に表示
+          </button> */}
+
         </div>}
         {activeTab === "rooftype" && <div>ここに屋根タイプを設定する画面を表示</div>}
         {activeTab === "landuse" && <div>ここに用途地域の着色を設定する画面を表示</div>}
         {activeTab === "terrain" && <div>ここに地形モデルを作成する画面を表示</div>}
       </div>
-      
-      <p>PC内のGeoJSONファイルを選択して、別ウインドウの地図に表示します。</p>
-
-      <button
-        onClick={handleSelectAndOpenMap}
-        style={{
-          padding: "12px, 24px",
-          fontSize: "16px",
-          cursor: "pointer",
-          backgroundColor: "#0066cc",
-          color: "white",
-          border: "none",
-          borderRadius: "6px",
-          fontWeight: "bold",
-        }}
-      >
-        GeoJSONファイルを選択して開く
-      </button>
-      
-      <div style={{ marginTop: "1.5rem", padding: "1rem", backgroundColor: "#f5f5f5", borderRadius: "6px"}}>
-        <p style={{ margin: "0 0 0,5rem 0" }}>
-          <strong>ステータス:</strong> {status}
-        </p>
-        {selectedFileName && (
-          <p style={{ margin: 0, fontSize: "0.9rem", color: "#555", wordBreak: "break-all" }}>
-            <strong> 選択ファイル:</strong> {selectedFileName}
-          </p>
-        )}
+      <div style={{ paddingLeft: '16px', fontFamily: 'monospace', fontSize: '12px' }}>
+        <p>進行状況：{status}</p>
       </div>
-
       <div>
         <button onClick={handleInit}>ログ新規作成</button>
         <button onClick={handleAction}>ログ追記</button>
@@ -331,65 +369,157 @@ function MainScreen() {
 
 // 2. 別画面（地図表示）コンポーネント
 function MapScreen() {
+  // ポリゴン塗りつぶしのスタイル定義
+  const fillLayerStyle: FillLayerSpecification = {
+    id: 'geojson-fill',
+    type: 'fill',
+    source: 'my-geojson',
+    paint: {
+      'fill-color': '#0080ff',
+      'fill-opacity': 0.4,
+    },
+  };
+
+  // ポリゴン境界線のスタイル定義
+  const lineLayerStyle: LineLayerSpecification = {
+    id: 'geojson-line',
+    type: 'line',
+    source: 'my-geojson',
+    paint: {
+      'line-color': '#0050aa',
+      'line-width': 2,
+    },
+  };
+
+  // 初期表示位置（名古屋周辺）
+  const [viewState] = useState({
+    longitude: 136.900,
+    latitude: 35.185,
+    zoom: 14,
+  });
+  const [convertedData, setConvertedData] = useState<FeatureCollection | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
-  const mapInstanceRef = useRef<L.Map | null>(null);
+  const mapInstanceRef = useRef<import("maplibre-gl").Map | null>(null);
+
+  // GeoJSONの座標を再帰的に取り出し、表示範囲（bounds）を計算する
+  const getGeoJsonBounds = (
+    data: FeatureCollection,
+    maplibre: typeof import("maplibre-gl")
+  ) => {
+    const bounds = new maplibre.LngLatBounds();
+    const visit = (value: unknown) => {
+      if (!Array.isArray(value)) return;
+      if (
+        value.length >= 2 &&
+        typeof value[0] === "number" &&
+        typeof value[1] === "number"
+      ) {
+        bounds.extend([value[0], value[1]]);
+        return;
+      }
+      value.forEach(visit);
+    };
+    data.features.forEach((feature) => {
+      if (feature.geometry) {
+        if (feature.geometry.type === "GeometryCollection") {
+          feature.geometry.geometries.forEach((geometry) => {
+            if ("coordinates" in geometry) visit(geometry.coordinates);
+          });
+        } else {
+          visit(feature.geometry.coordinates);
+        }
+      }
+    });
+    return bounds;
+  };
 
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
-    // Leaflet地図の初期化（初期中心座標は東京付近）
-    const map = L.map(mapContainerRef.current).setView([35.6812, 139.7671], 5);
-    mapInstanceRef.current = map;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
 
-    // OpenStreetMapのタイルレイヤーを追加
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      attribution: '&copy; OpenStreetMap contributors',
-    }).addTo(map);
+    void (async () => {
+      const maplibre = await import("maplibre-gl");
+      if (cancelled || !mapContainerRef.current) return;
 
-    // メイン画面からの地図データ受信を待機
-    const unlistenPromise = listen<GeoJSON.FeatureCollection>(
-      "load-map-data",
-      (event) => {
-        const geojsonData = event.payload;
-
-        // GeoJSONレイヤーを地図に追加
-        const geoJsonLayer = L.geoJSON(geojsonData, {
-          onEachFeature: (feature, layer) => {
-            // properties内のすべてのキーと値をHTMLテーブル形式でポップアップ表示
-            // if (feature.properties && Object.keys(feature.properties).length > 0) {
-            //   const rows = Object.entries(feature.properties)
-            //     .map(([KeyboardEvent, val]) => `<tr><th style="text-align:left;padding-right:8px;">${key}</th><td>${val}</td></tr>`)
-            //     .join("");              
-            //   layer.bindPopup(`<table>${rows}</table>`);
-            // }
-            if (feature.properties && feature.properties.name) {
-              layer.bindPopup(feature.properties.name);
-            }
+      const map = new maplibre.Map({
+        container: mapContainerRef.current,
+        style: {
+          version: 8,
+          sources: {
+            gsi: {
+              type: "raster",
+              tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+              tileSize: 256,
+              attribution: "&copy; OpenStreetMap contributors",
+            },
           },
-        }).addTo(map);
+          layers: [
+            {
+              id: "gsi-layer",
+              type: "raster",
+              source: "gsi",
+            },
+          ],
+        },
+        center: [viewState.longitude, viewState.latitude],
+        zoom: viewState.zoom,
+      });
 
-        // 読み込んだデータ全体が画面に収まるように自動ズーム
-        const bounds = geoJsonLayer.getBounds();
-        if (bounds.isValid()) {
-          map.fitBounds(bounds, { padding: [50, 50] });
-        }
-      }
-    );
+      map.addControl(new maplibre.NavigationControl(), "top-right");
+      mapInstanceRef.current = map;
 
-    // メイン画面に「描画準備完了」を通知
-    emit("map-window-ready");
+      unlisten = await listen<FeatureCollection>("load-map-data", (event) => {
+        setConvertedData(event.payload);
+      });
+
+      await emit("map-window-ready");
+    })();
 
     return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-      map.remove();
+      cancelled = true;
+      unlisten?.();
+      mapInstanceRef.current?.remove();
       mapInstanceRef.current = null;
     };
-  }, []);
+  }, [viewState]);
+
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map || !convertedData) return;
+
+    const updateData = async () => {
+      const maplibre = await import("maplibre-gl");
+      if (map.getSource("my-geojson")) {
+        (map.getSource("my-geojson") as import("maplibre-gl").GeoJSONSource).setData(convertedData);
+        const bounds = getGeoJsonBounds(convertedData, maplibre);
+        if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 40, maxZoom: 18 });
+        return;
+      }
+
+      map.addSource("my-geojson", {
+        type: "geojson",
+        data: convertedData,
+      });
+      map.addLayer(fillLayerStyle);
+      map.addLayer(lineLayerStyle);
+      const bounds = getGeoJsonBounds(convertedData, maplibre);
+      if (!bounds.isEmpty()) map.fitBounds(bounds, { padding: 40, maxZoom: 18 });
+    };
+
+    if (map.isStyleLoaded()) {
+      updateData();
+    } else {
+      map.once("load", updateData);
+    }
+  }, [convertedData, fillLayerStyle, lineLayerStyle]);
 
   return (
-    <div style={{ width: "100vw", height: "100vh", margin: 0, padding: 0 }}>
-      <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
-    </div>
+    <div
+      ref={mapContainerRef}
+      style={{ width: "100vw", height: "100vh", margin: 0, padding: 0 }}
+    />
   );
 }
 
